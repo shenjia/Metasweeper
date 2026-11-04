@@ -66,6 +66,11 @@ class MineSweeperGUI(MainWindowGUIImportExport):
             ms_board=getattr(self.label, 'ms_board', None))
         self.renderer = BoardRenderer()
 
+        # 防截屏开关：main.py 在 Windows 上注入真实实现；
+        # 默认空实现，保证任何构造路径（CLI/插件）都不会缺属性
+        self.disable_screenshot = lambda: None
+        self.enable_screenshot = lambda: None
+
         raw = self.game_setting.value('DEFAULT/allowed_controls', '', str)
         self._allowed_controls: set[str] = set(
             raw.split(',')) if raw else set()
@@ -223,14 +228,22 @@ class MineSweeperGUI(MainWindowGUIImportExport):
 
         self.reimportLEDPic(pixSize)
         self.label_2.reloadFace(pixSize)
+        # 窗口凹凸边框（阴影/高亮）跟随格子缩放，否则放大后边框过细而失真。
+        # 以启动时的格子尺寸为基准，保证默认外观与设计一致
+        if not hasattr(self, "_bevel_base_pix_size"):
+            self._bevel_base_pix_size = pixSize
+        bevel_scale = pixSize / self._bevel_base_pix_size
+        if hasattr(self, "frame_1"):
+            self.frame_1.setLineWidth(max(1, round(6 * bevel_scale)))
+            self.frame.setLineWidth(max(1, round(4 * bevel_scale)))
+            self.MinenumTimeWigdet.setLineWidth(
+                max(1, round(4 * bevel_scale)))
         self.set_face(FACE_SMILE)
         self.showMineNum(self.mineUnFlagedNum)
         self.showTime(0)
-        if hasattr(self, "_pixSize") and pixSize < self._pixSize:
-            self._pixSize = pixSize
-            self.minimumWindow()
-            return
+        # 放大和缩小都要让窗口贴合界面，否则放大后格子会被窗口裁剪
         self._pixSize = pixSize
+        self.minimumWindow()
 
     @property
     def gameMode(self):

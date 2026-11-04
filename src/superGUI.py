@@ -4,6 +4,7 @@ from PySide6.QtCore import QTranslator
 
 from PySide6.QtWidgets import QApplication
 import configparser
+import shutil
 from PySide6.QtGui import QPalette, QPixmap, QIcon
 from ui.ui_main_board import Ui_MainWindow
 from pathlib import Path
@@ -19,6 +20,7 @@ from config.constants import (
     BOARD_BEGINNER, BOARD_INTERMEDIATE, BOARD_EXPERT,
     FACE_SMILE, FACE_CLICK, FACE_LOST, FACE_WIN, FACE_SMILE_DOWN,
     LEVEL_NAME_BEGINNER, LEVEL_NAME_INTERMEDIATE, LEVEL_NAME_EXPERT, LEVEL_NAME_CUSTOM,
+    READY, BOARD_READY, MIN_PIX_SIZE, MAX_PIX_SIZE,
 )
 from utils.app_logger import logger
 from plugin_sdk import GameServerBridge
@@ -186,13 +188,28 @@ class Ui_MainWindow(Ui_MainWindow):
         # 设置全局路径，需要读写权限
         # WindowsPath('f:/path/solvable-minesweeper/src/main.py')
         r_path = Path(args[0])
-        # 检查是否有写入权限
-        if self._can_write_to(r_path.with_name('gameSetting.ini')):
+        if sys.platform == 'darwin':
+            # macOS：可写数据统一放 ~/Library/Application Support，
+            # 避免写入 .app 包内破坏代码签名封印
+            appdata_dir = Path.home() / 'Library' / 'Application Support'
+            self.setting_path = appdata_dir / ('Metasweeper' + version[1:])
+            self.setting_path.mkdir(parents=True, exist_ok=True)
+            # 一次性迁移旧版本写在 .app 包内的设置与录像
+            for _name in ('gameSetting.ini', 'record.ini', 'scoreBoardSetting.ini'):
+                _src, _dst = r_path.with_name(_name), self.setting_path / _name
+                if _src.is_file() and not _dst.exists():
+                    shutil.copy2(_src, _dst)
+            _old_replay = r_path.with_name('replay')
+            _new_replay = self.setting_path / 'replay'
+            _new_replay.mkdir(parents=True, exist_ok=True)
+            if _old_replay.is_dir() and not any(_new_replay.iterdir()):
+                shutil.copytree(_old_replay, _new_replay, dirs_exist_ok=True)
+        elif self._can_write_to(r_path.with_name('gameSetting.ini')):
             self.setting_path = r_path.parent
         else:
-            # 没权限，改用 %APPDATA%\你的程序名\
-            self.setting_path = Path(
-                os.environ['APPDATA']) / ('Metasweeper' + version[1:])
+            # 没权限，改用系统应用数据目录（Windows: %APPDATA%）
+            appdata_dir = Path(os.environ['APPDATA'])
+            self.setting_path = appdata_dir / ('Metasweeper' + version[1:])
             self.setting_path.mkdir(parents=True, exist_ok=True)
         # r_path是打包后_internal外面那一层，和exe同一级
         self.r_path = r_path
@@ -317,6 +334,15 @@ class Ui_MainWindow(Ui_MainWindow):
         self.label_11.mousewheelEvent.connect(self.mineNumWheel)
         self.label_12.mousewheelEvent.connect(self.mineNumWheel)
         self.label_13.mousewheelEvent.connect(self.mineNumWheel)
+
+        # 拖拽窗口边缘调整大小：棋盘区域优先吃掉多余空间，界面比例随之缩放
+        self.mainWindow.dragResize.connect(self.apply_drag_scale)
+        self.mainWindow.dragResizeFinished.connect(self.finish_drag_scale)
+        self.frame.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                 QtWidgets.QSizePolicy.Policy.Expanding)
+        self.verticalLayout_2.setStretch(0, 1)    # frame_1 优先于底部信息行伸展
+        self.verticalLayout.setStretch(1, 1)      # 板区行优先于 LED 计数条伸展
+        self.horizontalLayout_2.setStretch(1, 1)  # 棋盘框优先于两侧弹簧伸展
 
         self.mainWindow.keyRelease.connect(self.mineKeyReleaseEvent)
 
@@ -474,20 +500,73 @@ class Ui_MainWindow(Ui_MainWindow):
             v, str) and v.isdigit() else v for (k, v) in s}
 
     def minimumWindow(self):
-        # 最小化展示窗口，并固定尺寸
+        # 收缩窗口至与界面精确贴合；不再锁定窗口尺寸，允许拖拽边缘缩放
         self.label.setFixedSize(QtCore.QSize(self.pixSize*self.column,
                                              self.pixSize*self.row))
         self.windowSizeState = 'tight'
+        # 允许窗口向缩小方向拖拽到格子为最小尺寸(MIN_PIX_SIZE)为止
+        mw = self.mainWindow
+        hint = mw.minimumSizeHint()
+        if hint.isValid():
+            delta_w = (self.pixSize - MIN_PIX_SIZE) * self.column
+            delta_h = (self.pixSize - MIN_PIX_SIZE) * self.row
+            mw.setMinimumSize(max(1, hint.width() - delta_w),
+                              max(1, hint.height() - delta_h))
+            # 让窗口管理器按界面固有比例约束拖拽（macOS 原生等比锁）
+            mw.set_interface_aspect(hint.width(), hint.height())
+        # 吸附/布局自适应期间抑制拖拽判定，避免滚轮缩放引发的
+        # 程序化窗口变化被误判为用户拖拽
+        mw._suppress_drag = True
         self.timer_ = QTimer()
         self.timer_.timeout.connect(self.__minimumWindow)
         self.timer_.start(1)
 
     def __minimumWindow(self):
-        self.mainWindow.setFixedSize(self.mainWindow.minimumSize())
+        # 拖拽边缘期间不打断用户调整，松手后由 dragResizeFinished 吸附
+        if self.mainWindow.flag_drag_border:
+            return
+        hint = self.mainWindow.minimumSizeHint()
+        if hint.isValid():
+            # 程序化吸附打标记，避免被误判为用户拖拽
+            self.mainWindow._programmatic = True
+            self.mainWindow.resize(hint)
+            self.mainWindow._programmatic = False
         self.minimum_counter += 1
         if self.minimum_counter >= 100:
             self.minimum_counter = 0
             self.timer_.stop()
+            self.mainWindow._suppress_drag = False
+
+    def __drag_scale_target(self):
+        # 按棋盘框当前可容纳的空间，换算出整数格子边长
+        layout = self.mainWindow.layout()
+        if layout is not None:
+            layout.activate()  # 立即重算布局，避免测量到滞后的棋盘框尺寸
+        border = 2 * self.frame.lineWidth()
+        avail_w = self.frame.width() - border
+        avail_h = self.frame.height() - border
+        if avail_w <= 0 or avail_h <= 0:
+            return None
+        pix = min(avail_w // self.column, avail_h // self.row)
+        return max(MIN_PIX_SIZE, min(MAX_PIX_SIZE, pix))
+
+    def apply_drag_scale(self):
+        # 拖拽边缘调整窗口大小：界面比例实时跟随（仅未开局时生效，防止局面被重置）
+        if self.game_state != READY or\
+                self.label.ms_board.game_board_state != BOARD_READY:
+            return
+        pix = self.__drag_scale_target()
+        if pix and pix != self.pixSize:
+            self.pixSize = pix
+
+    def finish_drag_scale(self):
+        # 松手：把比例调整到位，并让窗口吸附到与界面精确贴合的大小
+        if self.game_state == READY and\
+                self.label.ms_board.game_board_state == BOARD_READY:
+            pix = self.__drag_scale_target()
+            if pix and pix != self.pixSize:
+                self.pixSize = pix
+        self.minimumWindow()
 
     def trans_language(self, language=""):
         if not language:
